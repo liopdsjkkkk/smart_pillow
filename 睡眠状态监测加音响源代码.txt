@@ -1,0 +1,277 @@
+import os
+import time
+import gc
+import ustruct
+import network
+import socket
+import math
+import json
+import yx
+from machine import Pin, ADC, UART, Timer
+from umqttsimple import MQTTClient
+import utime
+
+# ========== 配置区域 ==========
+MQTT_SERVER = "192.168.116.184"
+MQTT_TOPIC = "sleep_detect"
+SOUND_SYS_TOPIC = "music"
+CLIENT_ID = "esp32_audio_02"
+WIFI_SSID = 'honor'
+WIFI_PASS = '3304435775.'
+
+# 音响默认配置
+DEFAULT_MODE = "list_loop"
+DEFAULT_TIME_MIN = 30
+DEFAULT_TEMP = 28
+
+# 全局变量
+mqtt_client = None
+
+yx_mode = DEFAULT_MODE
+yx_time_min = DEFAULT_TIME_MIN
+yx_start_time = None
+yx_config_updated = False
+
+def connect_wifi():
+    global mqtt_client
+    wlan = network.WLAN(network.STA_IF)
+    wlan.active(True)
+    if not wlan.isconnected():
+        print('正在连接 WiFi...')
+        wlan.connect(WIFI_SSID, WIFI_PASS)
+        for _ in range(15):
+            if wlan.isconnected():
+                break
+            utime.sleep(1)
+    if wlan.isconnected():
+        print('连接成功，IP:', wlan.ifconfig()[0])
+        try:
+            mqtt_client = MQTTClient(CLIENT_ID, MQTT_SERVER)
+            mqtt_client.set_callback(mqtt_callback)
+            mqtt_client.connect()
+            mqtt_client.subscribe(SOUND_SYS_TOPIC)
+            print("MQTT连接成功，已订阅主题:", SOUND_SYS_TOPIC)
+        except Exception as e:
+            print("MQTT连接失败:", e)
+        return True
+    print('WiFi连接失败')
+    return False
+
+def mqtt_callback(topic, msg):
+    global yx_mode, yx_time_min, yx_start_time, yx_config_updated
+
+    try:
+        data = json.loads(msg)
+    except Exception as e:
+        print("MQTT消息解析失败:", e)
+        return
+
+    action = data.get("action")
+    print("收到音响指令:", data)
+
+    if action == "reset":
+        yx_mode = DEFAULT_MODE
+        yx_time_min = DEFAULT_TIME_MIN
+        yx_start_time = time.time()
+        yx.clear_collection()
+        yx.uart2.write(yx.CMD_LIST_LOOP)
+        print("音响重置为默认配置")
+        yx_config_updated = True
+        return
+
+    if action == "single_loop":
+        yx_mode = "single_loop"
+        yx.uart2.write(yx.CMD_SINGLE_LOOP)
+        yx_config_updated = True
+    elif action == "list_loop":
+        yx_mode = "list_loop"
+        yx.uart2.write(yx.CMD_LIST_LOOP)
+        yx_config_updated = True
+    elif action == "random_play":
+        yx_mode = "random_play"
+        yx.uart2.write(yx.CMD_RANDOM_PLAY)
+        yx_config_updated = True
+    elif action == "last_song":
+        yx.uart2.write(yx.CMD_LASTSONG)
+        yx_config_updated = True
+    elif action == "next_song":
+        yx.uart2.write(yx.CMD_NEXTSONG)
+        yx_config_updated = True
+    elif action == "suspend":
+        yx.uart2.write(yx.CMD_SUSPEND)
+        yx_config_updated = True
+    elif action == "play":
+        print("执行播放指令 CMD_PLAY")
+        yx.uart2.write(yx.CMD_PLAY)
+        yx_config_updated = True
+    elif action == "volume_up":
+        yx.uart2.write(yx.CMD_VOLUMEP1)
+        yx_config_updated = True
+    elif action == "volume_low":
+        yx.uart2.write(yx.CMD_VOLUMEP2)
+        yx_config_updated = True
+    elif action == "collect":
+        yx.collect()
+        yx_config_updated = True
+    elif action == "play_collection":
+        yx.play_collection()
+        yx_config_updated = True
+    elif action == "set_time":
+        t = data.get("time")
+        if 1 <= t <= 180:
+            yx_time_min = t
+            print(f"播放时长设置为 {t} 分钟")
+            yx.reset_play_timer()
+            yx_config_updated = True
+
+    if yx_config_updated:
+        yx_start_time = time.time()
+
+def check_play_duration():
+    global yx_start_time, yx_time_min
+    if yx_start_time is not None and yx_time_min > 0:
+        elapsed = (time.time() - yx_start_time) / 60
+        if elapsed >= yx_time_min:
+            yx.uart2.write(yx.CMD_PAUSE)
+            print("播放时间结束，已暂停播放")
+            yx_start_time = None
+
+class Config:
+    SENSOR_PINS = [39, 35, 34]
+    SAMPLING_PERIOD_MS = 100
+    BUFFER_SIZE = 300
+    SLEEP_THRESHOLD = 500
+    SENSOR_WEIGHTS = [0.3, 0.4, 0.3]
+
+class SleepMonitor:
+    def __init__(self):
+        self.sensors = self.init_sensors()
+        self.buffer = [[0] * Config.BUFFER_SIZE for _ in range(3)]
+        self.index = 0
+        self.sleep_stage = "AWAKE"
+        self.last_stage = None
+        self.stable_counter = 0
+        self.sleep_start_time = None
+        self.light_sleep_duration = 0
+        self.deep_sleep_duration = 0
+        self.in_sleep_session = False
+
+    def init_sensors(self):
+        sensor_list = []
+        for pin in Config.SENSOR_PINS:
+            adc = ADC(Pin(pin))
+            adc.atten(ADC.ATTN_11DB)
+            sensor_list.append(adc)
+        return sensor_list
+
+    def update(self):
+        values = [s.read() for s in self.sensors]
+        for i in range(3):
+            self.buffer[i][self.index] = values[i]
+        self.index = (self.index + 1) % Config.BUFFER_SIZE
+        self.analyze_sleep(values)
+
+    def analyze_sleep(self, current_values):
+        avg_pressure = sum(w * v for w, v in zip(Config.SENSOR_WEIGHTS, current_values))
+        variability = self.calculate_variability()
+        current_time = utime.time()
+
+        new_stage = self.sleep_stage
+
+        if avg_pressure < Config.SLEEP_THRESHOLD:
+            new_stage = "NO_PERSON"
+            self.stable_counter = 0
+        elif variability > 30:
+            new_stage = "AWAKE"
+            self.stable_counter = 0
+        elif variability > 10:
+            new_stage = "LIGHT_SLEEP"
+            self.stable_counter = 0
+        else:
+            self.stable_counter += 1
+            new_stage = "DEEP_SLEEP" if self.stable_counter > 600 else "LIGHT_SLEEP"
+
+        if new_stage != self.sleep_stage:
+            if self.in_sleep_session and new_stage not in ["LIGHT_SLEEP", "DEEP_SLEEP"]:
+                self.print_sleep_summary()
+                self.in_sleep_session = False
+            if not self.in_sleep_session and new_stage in ["LIGHT_SLEEP", "DEEP_SLEEP"]:
+                self.sleep_start_time = current_time
+                self.light_sleep_duration = 0
+                self.deep_sleep_duration = 0
+                self.in_sleep_session = True
+
+            self.last_stage = self.sleep_stage
+            self.sleep_stage = new_stage
+            print(f"状态变更: {self.last_stage} → {self.sleep_stage}")
+
+        if self.in_sleep_session:
+            if self.sleep_stage == "LIGHT_SLEEP":
+                self.light_sleep_duration += Config.SAMPLING_PERIOD_MS / 1000
+            elif self.sleep_stage == "DEEP_SLEEP":
+                self.deep_sleep_duration += Config.SAMPLING_PERIOD_MS / 1000
+
+        print(f"状态: {self.sleep_stage} | 压力: {avg_pressure:.0f} | 变异度: {variability:.1f}")
+
+    def calculate_variability(self):
+        variability = 0
+        for i in range(3):
+            mean = sum(self.buffer[i]) / Config.BUFFER_SIZE
+            variance = sum((x - mean) ** 2 for x in self.buffer[i]) / Config.BUFFER_SIZE
+            variability += math.sqrt(variance)
+        return variability / 3
+
+    def print_sleep_summary(self):
+        if self.sleep_start_time:
+            duration = utime.time() - self.sleep_start_time
+            print("\n========== 💤 本次睡眠统计 ==========")
+            print(f"总时长: {int(duration // 3600)}小时 {int((duration % 3600) // 60)}分钟 {int(duration % 60)}秒")
+            print(f"浅睡时长: {int(self.light_sleep_duration // 3600)}小时 {int((self.light_sleep_duration % 3600) // 60)}分钟 {int(self.light_sleep_duration % 60)}秒")
+            print(f"深睡时长: {int(self.deep_sleep_duration // 3600)}小时 {int((self.deep_sleep_duration % 3600) // 60)}分钟 {int(self.deep_sleep_duration % 60)}秒")
+            print("====================================\n")
+
+            try:
+                report = {
+                    "device_id": "pillow-00001",
+                    "total_seconds": int(duration),
+                    "light_sleep_seconds": int(self.light_sleep_duration),
+                    "deep_sleep_seconds": int(self.deep_sleep_duration),
+                    "timestamp": utime.time()
+                }
+                mqtt_client.publish(MQTT_TOPIC, json.dumps(report))
+                print("MQTT 已发送睡眠报告")
+            except Exception as e:
+                print("MQTT 发送失败:", e)
+
+if __name__ == "__main__":
+    if not connect_wifi():
+        raise SystemExit("WiFi/MQTT 初始化失败")
+
+    monitor = SleepMonitor()
+    timer = Timer(-1)
+    last_ping_time = utime.time()
+
+    def sampling_callback(t):
+        monitor.update()
+        check_play_duration()
+
+    try:
+        timer.init(period=Config.SAMPLING_PERIOD_MS, mode=Timer.PERIODIC, callback=sampling_callback)
+        yx.setvolume()
+        while True:
+            utime.sleep(1)
+            mqtt_client.check_msg() 
+            if utime.time() - last_ping_time > 60:
+                try:
+                    mqtt_client.ping()
+                    print("MQTT 保活成功")
+                except Exception as e:
+                    print("MQTT ping失败，可能断开:", e)
+                last_ping_time = utime.time()
+            yx.process_uart_command()
+    except KeyboardInterrupt:
+        timer.deinit()
+        print("监测已停止")
+
+
+

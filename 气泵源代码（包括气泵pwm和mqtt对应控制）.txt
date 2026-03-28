@@ -1,0 +1,236 @@
+import time
+import utime
+from machine import Pin, PWM, reset
+import network
+from umqttsimple import MQTTClient
+import ujson
+
+# =============================================
+# 硬件配置（根据实际接线修改）
+# =============================================
+led = Pin(2, Pin.OUT)
+led.value(1)
+
+# 左气泵控制引脚
+ena = Pin(14, Pin.OUT)
+in1 = Pin(13, Pin.OUT)
+in2 = Pin(12, Pin.OUT)
+pwm_left = PWM(ena, freq=500, duty=0)
+
+# 右气泵控制引脚
+enb = Pin(32, Pin.OUT)
+in3 = Pin(33, Pin.OUT)
+in4 = Pin(27, Pin.OUT)
+pwm_right = PWM(enb, freq=500, duty=0)
+
+# 气囊继电器
+relay1_pin = Pin(25, Pin.OUT)  # 左气囊放气阀
+relay2_pin = Pin(26, Pin.OUT)  # 右气囊放气阀
+
+# =============================================
+# 全局变量
+# =============================================
+intervention_stage = 0
+last_action_time = 0
+cooldown_interval = 3  # 秒，气泵冷却时间
+last_reset_day = None
+
+# =============================================
+# WiFi连接
+# =============================================
+def connect_wifi():
+    wlan = network.WLAN(network.STA_IF)
+    wlan.active(True)
+    if not wlan.isconnected():
+        print("Connecting to WiFi...")
+        wlan.connect("honor", "3304435775.")  # WiFi账号密码
+        for _ in range(20):
+            if wlan.isconnected():
+                break
+            time.sleep(1)
+        else:
+            print("WiFi连接失败，重启中")
+            reset()
+    print("WiFi连接成功，IP:", wlan.ifconfig()[0])
+
+# =============================================
+# 气囊控制函数
+# =============================================
+def inflate_left(duration=27):
+    in1.on()
+    in2.off()
+    pwm_left.duty(320)
+    relay1_pin.off()  # 关闭放气阀
+    print("左气囊充气中...")
+    time.sleep(duration)
+    pwm_left.duty(0)
+
+def inflate_right(duration=27):
+    in3.on()
+    in4.off()
+    pwm_right.duty(320)
+    relay2_pin.off()
+    print("右气囊充气中...")
+    time.sleep(duration)
+    pwm_right.duty(0)
+
+def deflate_left(duration=15):
+    print("左气囊放气中...")
+    relay1_pin.on()
+    time.sleep(duration)
+    relay1_pin.off()
+
+def deflate_right(duration=15):
+    print("右气囊放气中...")
+    relay2_pin.on()
+    time.sleep(duration)
+    relay2_pin.off()
+
+def deflate_all(duration=15):
+    print("所有气囊放气中...")
+    relay1_pin.on()
+    relay2_pin.on()
+    time.sleep(duration)
+    relay1_pin.off()
+    relay2_pin.off()
+
+# =============================================
+# MQTT回调处理函数
+# =============================================
+def mqtt_callback(topic, msg):
+    global last_action_time, intervention_stage
+    try:
+        data = ujson.loads(msg)
+        print("收到消息:", topic, data)
+
+        if topic == b"sound_detect":
+            if data.get("status") == "hansheng":
+                current_time = time.time()
+                if current_time - last_action_time < cooldown_interval:
+                    print("气泵冷却中，跳过干预")
+                    return
+                last_action_time = current_time
+                led.value(0)
+
+                deflate_all(duration=2)  # 干预前放气安全处理
+
+                if intervention_stage == 0:
+                    print("第1次干预（左）")
+                    inflate_left(duration=20) # 充气时间设置
+                    time.sleep(20)
+                    deflate_left()
+                    intervention_stage = 1
+                    print("左侧干预完成，等待下次") # 充气时间设置
+                elif intervention_stage == 1:
+                    print("第2次干预（右）")
+                    inflate_right(duration=20)
+                    time.sleep(20)
+                    deflate_right()
+                    intervention_stage = 2
+                    print("右侧干预完成，进入冷却阶段")
+                elif intervention_stage == 2:
+                    print("已完成两次干预，冷却中...")
+
+                led.value(1)
+
+        elif topic == b"qinang":
+            command = data.get("action")
+            print("收到用户命令:", command)
+
+            if command == "inflate_left":
+                deflate_all(2)
+                inflate_left()
+            elif command == "inflate_right":
+                deflate_all(2)
+                inflate_right()
+            elif command == "inflate_all":
+                deflate_all(2)
+                inflate_left()
+                inflate_right()
+            elif command == "deflate_left":
+                deflate_left()
+            elif command == "deflate_right":
+                deflate_right()
+            elif command == "deflate_all":
+                deflate_all()
+            elif command == "reset":
+                intervention_stage = 0
+                print("干预状态已手动重置")
+
+    except Exception as e:
+        print("MQTT处理错误:", e)
+
+# =============================================
+# MQTT连接
+# =============================================
+def connect_mqtt():
+    client = MQTTClient(
+        client_id="esp32_motor",
+        server="192.168.116.184",
+        port=1883,
+        keepalive=60
+    )
+    client.set_callback(mqtt_callback)
+    try:
+        client.connect()
+        client.subscribe(b"sound_detect")
+        client.subscribe(b"qinang")
+        print("MQTT连接成功")
+        return client
+    except OSError as e:
+        print("MQTT连接失败:", e)
+        time.sleep(5)
+        reset()
+
+# =============================================
+# 每天9点自动重置干预状态
+# =============================================
+def auto_reset_check():
+    global last_reset_day, intervention_stage
+    t = utime.localtime()
+    if t[3] == 9 and last_reset_day != t[2]:
+        intervention_stage = 0
+        last_reset_day = t[2]
+        print("每天9点自动重置干预状态")
+
+# =============================================
+# 主程序
+# =============================================
+try:
+    connect_wifi()
+    mqtt_client = connect_mqtt()
+
+    last_ping_time = time.time()
+
+    while True:
+        try:
+            mqtt_client.check_msg()
+            auto_reset_check()
+
+            # 每隔30秒发送一次ping保持连接
+            if time.time() - last_ping_time > 30:
+                try:
+                    mqtt_client.ping()
+                    print("发送MQTT心跳PING")
+                except Exception as e:
+                    print("PING失败，尝试重连:", e)
+                    mqtt_client = connect_mqtt()  # 断线重连
+                last_ping_time = time.time()
+
+        except OSError as e:
+            print("MQTT连接异常，重连中:", e)
+            mqtt_client = connect_mqtt()
+
+        time.sleep(0.1)
+
+except KeyboardInterrupt:
+    print("程序终止")
+    pwm_left.duty(0)
+    pwm_right.duty(0)
+    relay1_pin.off()
+    relay2_pin.off()
+    mqtt_client.disconnect()
+
+
+
+

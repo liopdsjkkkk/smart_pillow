@@ -1,0 +1,487 @@
+import os
+import time
+import gc
+import ustruct
+import network
+import socket
+from machine import Pin, ADC, SoftSPI, Timer, UART
+from sdcard import SDCard
+from umqttsimple import MQTTClient
+import json
+import onewire, ds18x20
+
+# ====== 配置区 ======
+WIFI_SSID = 'honor'
+WIFI_PASS = '3304435775.'
+SERVER_URL = 'http://47.108.224.225:5001/predict'
+MQTT_SERVER = "192.168.116.184"
+MQTT_TOPIC = "sound_detect"
+WENMENG_TOPIC = "wenmeng"
+SNORE_TIME_TOPIC = "snore_time"
+CLIENT_ID = "esp32_audio_01"
+
+SD_PINS = {'miso': 19, 'mosi': 23, 'sck': 18, 'cs': 5}
+ADC_PIN = 34
+LED_PIN = 2
+RELAY_PIN = 32
+DS18B20_PIN = 33
+
+RECORD_TIME = 4
+SAMPLE_RATE = 8000
+THRESHOLD = 30
+TEMP_THRESHOLD = 33
+FILENAME_TEMPLATE = '/sd/rec_{}.wav'
+
+# 默认温梦参数
+DEFAULT_MODE = "continuous_heat"  # 持续加热
+DEFAULT_TIME_MIN = 30
+DEFAULT_TEMP = 28
+
+# 全局状态变量
+wenmeng_mode = DEFAULT_MODE
+wenmeng_time_min = DEFAULT_TIME_MIN
+wenmeng_temp = DEFAULT_TEMP
+wenmeng_start_time = None
+wenmeng_config_updated = False
+
+snore_start = None  # 打鼾开始时间
+
+# 硬件引脚初始化
+led_pin = Pin(LED_PIN, Pin.OUT)
+relay_pin = Pin(RELAY_PIN, Pin.OUT)
+ds_sensor = ds18x20.DS18X20(onewire.OneWire(Pin(DS18B20_PIN)))
+mqtt_client = None
+
+# ADC初始化
+adc = ADC(Pin(ADC_PIN))
+adc.atten(ADC.ATTN_11DB)
+adc.width(ADC.WIDTH_12BIT)
+
+# UART 初始化（串口指令处理）
+uart = UART(2, 115200)
+
+# 定时器用于温梦模式间断控制
+timer = Timer(-1)
+
+
+def connect_wifi():
+    global mqtt_client
+    wlan = network.WLAN(network.STA_IF)
+    wlan.active(True)
+    if not wlan.isconnected():
+        print('正在连接 WiFi...')
+        wlan.connect(WIFI_SSID, WIFI_PASS)
+        for _ in range(15):
+            if wlan.isconnected():
+                break
+            time.sleep(1)
+    if wlan.isconnected():
+        print('连接成功，IP:', wlan.ifconfig()[0])
+        try:
+            mqtt_client = MQTTClient(CLIENT_ID, MQTT_SERVER)
+            mqtt_client.set_callback(mqtt_callback)
+            mqtt_client.connect()
+            mqtt_client.subscribe(WENMENG_TOPIC)
+            print("MQTT连接成功，已订阅主题:", WENMENG_TOPIC)
+        except Exception as e:
+            print("MQTT连接失败:", e)
+        return True
+    print('WiFi连接失败')
+    return False
+
+
+def init_sd_card():
+    try:
+        spi = SoftSPI(sck=Pin(SD_PINS['sck']), mosi=Pin(SD_PINS['mosi']), miso=Pin(SD_PINS['miso']))
+        sd = SDCard(spi, Pin(SD_PINS['cs']))
+        os.mount(sd, '/sd')
+        print('SD卡挂载成功')
+        return True
+    except Exception as e:
+        print('SD卡挂载失败:', e)
+        return False
+
+
+def write_wav_header(file, sample_rate, bits, channels, data_size):
+    file.write(b'RIFF')
+    file.write(ustruct.pack('<I', 36 + data_size))
+    file.write(b'WAVEfmt ')
+    file.write(ustruct.pack('<IHHIIHH', 16, 1, channels, sample_rate,
+                            sample_rate * channels * bits // 8,
+                            channels * bits // 8, bits))
+    file.write(b'data')
+    file.write(ustruct.pack('<I', data_size))
+
+
+def record_wav(filename, seconds=RECORD_TIME):
+    wav = open(filename, 'wb')
+    wav.write(b'\x00' * 44)
+    total_size = 0
+    silent_blocks = 0
+    total_blocks = 0
+    max_avg = 0
+
+    interval = 1 / SAMPLE_RATE
+    samples = int(SAMPLE_RATE * seconds)
+
+    for _ in range(samples):
+        val = adc.read()
+        val -= 2048
+        sample = ustruct.pack('<h', val)
+        wav.write(sample)
+        total_size += 2
+
+        total = abs(val)
+        max_avg = max(max_avg, total)
+
+        if total < THRESHOLD:
+            silent_blocks += 1
+        total_blocks += 1
+
+        time.sleep_us(int(interval * 1e6))
+
+    wav.close()
+
+    silent_ratio = silent_blocks / total_blocks if total_blocks else 1
+    print("静音块比例：{:.2f}，最大音量：{}".format(silent_ratio, max_avg))
+
+    if silent_ratio > 0.98 and max_avg < THRESHOLD * 2:
+        print("检测为静音，跳过上传")
+        os.remove(filename)
+        return None
+
+    wav = open(filename, 'r+b')
+    write_wav_header(wav, SAMPLE_RATE, 16, 1, total_size)
+    wav.close()
+    return filename
+
+
+def parse_response(response):
+    try:
+        header_end = response.find(b'\r\n\r\n') + 4
+        json_str = response[header_end:].decode()
+        return json.loads(json_str)
+    except Exception as e:
+        print("响应解析失败:", e)
+        return None
+
+
+def mqtt_callback(topic, msg):
+    global wenmeng_mode, wenmeng_time_min, wenmeng_temp, wenmeng_start_time, wenmeng_config_updated
+
+    try:
+        data = json.loads(msg)
+    except Exception as e:
+        print("MQTT消息解析失败:", e)
+        return
+
+    action = data.get("action")
+    print("收到温梦指令:", data)
+
+    if action == "reset":
+        wenmeng_mode = DEFAULT_MODE
+        wenmeng_time_min = DEFAULT_TIME_MIN
+        wenmeng_temp = DEFAULT_TEMP
+        wenmeng_start_time = time.time()
+        print("温梦重置为默认配置")
+        wenmeng_config_updated = True
+        control_wenmeng_relay(print_log=True)
+        return
+
+    if action == "interval_heat":
+        wenmeng_mode = "interval_heat"
+        wenmeng_config_updated = True
+    elif action == "interval_stop":
+        wenmeng_mode = "interval_stop"
+        wenmeng_config_updated = True
+    elif action == "continuous_heat":
+        wenmeng_mode = "continuous_heat"
+        wenmeng_config_updated = True
+    elif action == "set_time":
+        t = data.get("time")
+        if isinstance(t, int) and t > 0:
+            wenmeng_time_min = t
+            wenmeng_config_updated = True
+    elif action == "set_temp":
+        temp = data.get("temp")
+        if isinstance(temp, (int, float)) and temp > 0:
+            wenmeng_temp = temp
+            wenmeng_config_updated = True
+
+    if wenmeng_config_updated:
+        wenmeng_start_time = time.time()
+        control_wenmeng_relay(print_log=True)
+
+
+def control_wenmeng_relay(timer=None, print_log=False):
+    global wenmeng_mode, wenmeng_time_min, wenmeng_temp, wenmeng_start_time
+
+    if wenmeng_start_time is None:
+        relay_pin.value(1)
+        if print_log:
+            print("[温梦状态] 未开始温梦，默认持续加热")
+        return
+
+    elapsed_min = (time.time() - wenmeng_start_time) / 60
+    if elapsed_min >= wenmeng_time_min:
+        relay_pin.value(0)
+        if print_log:
+            print("[温梦状态] 已达到设定时间 {}分钟，停止加热".format(wenmeng_time_min))
+        return
+
+    roms = ds_sensor.scan()
+    if roms:
+        ds_sensor.convert_temp()
+        time.sleep_ms(750)
+        temp = ds_sensor.read_temp(roms[0])
+    else:
+        temp = None
+
+    if print_log:
+        print("[温梦状态] 当前模式: {}, 目标温度: {}℃, 目标时间: {}分钟".format(
+            wenmeng_mode, wenmeng_temp, wenmeng_time_min))
+        if temp is not None:
+            print("[温梦状态] 当前温度: {:.2f}℃".format(temp))
+        else:
+            print("[温梦状态] 温度读取失败")
+
+    if temp is not None and temp >= wenmeng_temp:
+        relay_pin.value(0)
+        if print_log:
+            print("[温梦控制] 当前温度超设定，关闭加热")
+        return
+
+    if wenmeng_mode == "continuous_heat":
+        relay_pin.value(1)
+        if print_log:
+            print("[温梦控制] 持续加热中，继电器打开")
+    elif wenmeng_mode == "interval_heat":
+        if timer is None:
+            timer.init(period=30000, mode=Timer.PERIODIC,
+                       callback=lambda t: relay_pin.value(1 - relay_pin.value()))
+        if print_log:
+            print("[温梦控制] 间断加热模式，30秒切换一次")
+    elif wenmeng_mode == "interval_stop":
+        if timer is None:
+            timer.init(period=30000, mode=Timer.PERIODIC,
+                       callback=lambda t: relay_pin.value(relay_pin.value() ^ 1))
+        if print_log:
+            print("[温梦控制] 间断停热模式，30秒切换一次")
+    else:
+        relay_pin.value(1)
+        if print_log:
+            print("[温梦控制] 未识别模式，默认持续加热")
+
+
+def upload_audio(file_path):
+    global mqtt_client, snore_start
+    filename = file_path.split('/')[-1]
+    parts = SERVER_URL.split('/')
+    host_port = parts[2].split(':')
+    host = host_port[0]
+    port = int(host_port[1]) if len(host_port) > 1 else 80
+    path = '/' + '/'.join(parts[3:])
+    boundary = '----WebKitFormBoundary{}'.format(time.ticks_ms())
+    file_header = (
+        '--{}\r\n'
+        'Content-Disposition: form-data; name="file"; filename="{}"\r\n'
+        'Content-Type: application/octet-stream\r\n\r\n'
+    ).format(boundary, filename).encode()
+    file_footer = '\r\n--{}--\r\n'.format(boundary).encode()
+    file_size = os.stat(file_path)[6]
+    total_length = len(file_header) + file_size + len(file_footer)
+
+    try:
+        addr_info = socket.getaddrinfo(host, port)[0]
+        sock = socket.socket(addr_info[0], addr_info[1], addr_info[2])
+        sock.settimeout(30)
+        sock.connect(addr_info[-1])
+
+        headers = [
+            'POST {} HTTP/1.1'.format(path),
+            'Host: {}'.format(host),
+            'Content-Type: multipart/form-data; boundary={}'.format(boundary),
+            'Content-Length: {}'.format(total_length),
+            'Connection: close',
+            '\r\n'
+        ]
+        sock.send('\r\n'.join(headers).encode())
+        sock.send(file_header)
+
+        with open(file_path, 'rb') as f:
+            while True:
+                chunk = f.read(512)
+                if not chunk:
+                    break
+                sock.send(chunk)
+                time.sleep_ms(30)
+                gc.collect()
+
+        sock.send(file_footer)
+
+        response = b''
+        try:
+            while True:
+                chunk = sock.recv(1024)
+                if not chunk:
+                    break
+                response += chunk
+        except:
+            pass
+
+        print('服务器响应:')
+        print(response.decode())
+
+        result = parse_response(response)
+        print("识别结果:", result)
+
+        if result and result.get('class') in ['dahan', 'xiaohan']:
+            led_pin.value(1)
+
+            if snore_start is None:
+                snore_start = time.time()
+                print("鼾声开始：", snore_start)
+
+            try:
+                mqtt_client.publish(MQTT_TOPIC, json.dumps({"status": "hansheng"}))
+                print("鼾声检测已发送MQTT")
+            except Exception as e:
+                print("MQTT发送失败:", e)
+
+        else:
+            led_pin.value(0)
+
+            if snore_start is not None:
+                snore_duration = int(time.time() - snore_start)
+                snore_start = None
+                print("本次打鼾时长：{} 秒".format(snore_duration))
+
+                try:
+                    mqtt_client.publish(SNORE_TIME_TOPIC, json.dumps({
+                        "device_id": "pillow-00001",
+                        "snore time": snore_duration
+                    }))
+                    print("打鼾时长已发送MQTT")
+                except Exception as e:
+                    print("打鼾时长 MQTT 发送失败:", e)
+
+        return True
+
+    except Exception as e:
+        print('上传失败:', e)
+        return False
+
+    finally:
+        sock.close()
+        gc.collect()
+
+
+def handle_uart_command():
+    global wenmeng_mode, wenmeng_temp, wenmeng_time_min, wenmeng_start_time, wenmeng_config_updated
+    data = uart.read()
+    if data:
+        try:
+            command = data.decode().strip()
+            print("收到 UART 指令:", command)
+
+            if command == "start":
+                wenmeng_mode = "continuous_heat"
+                wenmeng_temp = 28
+                wenmeng_time_min = 30
+                wenmeng_start_time = time.time()
+                wenmeng_config_updated = True
+                print("[执行] 启动加热：模式=持续加热，温度=28℃，时长=30分钟")
+
+            elif command == "stop":
+                wenmeng_time_min = 0
+                wenmeng_start_time = time.time()
+                relay_pin.value(0)
+                print("[执行] 停止加热，继电器关闭")
+
+            elif command == "high_temp":
+                wenmeng_temp = 40
+                wenmeng_start_time = time.time()
+                wenmeng_config_updated = True
+                print("[执行] 设置高温：40℃")
+
+            elif command == "mid_temp":
+                wenmeng_temp = 30
+                wenmeng_start_time = time.time()
+                wenmeng_config_updated = True
+                print("[执行] 设置中温：30℃")
+
+            elif command == "low_temp":
+                wenmeng_temp = 25
+                wenmeng_start_time = time.time()
+                wenmeng_config_updated = True
+                print("[执行] 设置低温：25℃")
+
+            elif command == "shengwen":
+                wenmeng_temp = min(wenmeng_temp + 3, 45)
+                wenmeng_start_time = time.time()
+                wenmeng_config_updated = True
+                print(f"[执行] 升温：当前温度调整为 {wenmeng_temp}℃")
+
+            elif command == "jiangwen":
+                wenmeng_temp = max(wenmeng_temp - 3, 0)
+                wenmeng_start_time = time.time()
+                wenmeng_config_updated = True
+                print(f"[执行] 降温：当前温度调整为 {wenmeng_temp}℃")
+
+            else:
+                print("[警告] 未知指令:", command)
+
+        except Exception as e:
+            print("[错误] 串口解析失败:", e)
+
+
+def main():
+    global mqtt_client, wenmeng_start_time
+
+    gc.enable()
+    led_pin.value(0)
+    relay_pin.value(1)
+    wenmeng_start_time = None
+
+    if not connect_wifi():
+        return
+    if not init_sd_card():
+        return
+
+    timer.deinit()
+
+    while True:
+        try:
+            mqtt_client.check_msg()
+        except Exception as e:
+            print("MQTT检查消息异常:", e)
+
+        handle_uart_command()  # 新增：串口指令处理
+
+        control_wenmeng_relay(timer)
+
+        timestamp = time.time()
+        filename = FILENAME_TEMPLATE.format(timestamp)
+        print('开始录音...')
+        result = record_wav(filename)
+        if result:
+            print("音频录制完成，开始上传")
+            if upload_audio(result):
+                os.remove(result)
+                print("上传成功，已删除文件")
+            else:
+                print("上传失败或未识别，保留文件")
+        else:
+            print("本轮为静音，未上传")
+
+        wait_time = 60 - RECORD_TIME
+        print("等待 {:.1f} 秒开始下一次录音...\n".format(wait_time))
+        time.sleep(wait_time)
+
+
+if __name__ == '__main__':
+    main()
+
+
+
+
